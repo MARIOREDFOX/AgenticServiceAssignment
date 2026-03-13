@@ -1,72 +1,147 @@
 """
 Historical Data Agent
 ----------------------
-Converts raw ServiceNow ticket fields into numerical feature vectors
-used by the Prediction Agent.
+Converts ServiceNow ticket fields into numeric feature vectors.
 
-Key design: short_description is scored SEPARATELY and with HIGHER WEIGHT
-than description, because:
-  - It is always filled in (description can be empty or vague)
-  - It captures the engineer's primary intent in a few words
-  - Categories are often empty or generic — we cannot rely on them
+HOW ROUTING WORKS:
+  Assignment group is decided by keywords found in SHORT DESCRIPTION
+  and DESCRIPTION only. Category/subcategory are identical across all 50
+  tickets ("Applications and Software / Business Application") so they add
+  zero routing value. Configuration Item is ignored as requested.
+
+  Short description keywords are counted TWICE (2x weight) because:
+    - It is always filled — description can be vague or empty
+    - It is the engineer's primary intent in one line
+    - Real tickets like "DIMS", "ILOS", "VIM" have the full signal there
+
+KEYWORD SETS:
+  Derived by reading every SD + Description in the CSV and identifying
+  words that uniquely appear in each team's tickets.
 """
 
 import csv
 import hashlib
 import logging
 from typing import Optional
-
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 def stable_hash(value: str, mod: int = 100) -> int:
-    """Deterministic hash of a string, bucketed into [0, mod)."""
     if not value:
         return 0
-    digest = int(hashlib.md5(value.lower().encode()).hexdigest(), 16)
-    return digest % mod
+    return int(hashlib.md5(value.lower().encode()).hexdigest(), 16) % mod
 
 
-def keyword_hits(text: str, keywords: set) -> int:
-    """Count distinct keyword matches in text. Capped at 5."""
+def kw_score(text: str, keywords: set) -> int:
+    """Count how many keywords from the set appear in text. Cap at 5."""
     t = text.lower()
     return min(sum(1 for kw in keywords if kw in t), 5)
 
 
-# ── Keyword sets (used in both feature engineering AND confidence scoring) ─────
-CLOUD_KEYWORDS = {
-    "azure", "aws", "gcp", "cloud", "kubernetes", "k8s", "docker",
-    "container", "pod", "helm", "terraform", "blob", "s3", "lambda",
-    "ec2", "vm", "virtual machine", "pipeline", "ci/cd", "devops",
-    "serverless", "cloudfront", "rds", "eks", "aks", "ingress",
-    "namespace", "deployment", "node", "cluster", "registry", "vpc",
-    "iam", "bucket", "snapshot", "app service", "cloud run",
-    "elasticsearch", "grafana", "cloudwatch", "oom", "crashloopbackoff",
-    "imagepullbackoff", "kubectl", "helm chart", "terraform", "bicep",
+# ─────────────────────────────────────────────────────────────────────────────
+# Keywords derived directly by reading SD + Description of all 50 CSV tickets.
+# Each set contains words that ONLY appear in that team's tickets.
+# ─────────────────────────────────────────────────────────────────────────────
+TEAM_KEYWORDS: dict[str, set] = {
+
+    # Tickets 1-10: INFOR WMS + Kisoft issues
+    # Unique words from SD+DESC: infor, kisoft, knapp, systore, wms,
+    #   route, routes, shipment, load, crossdock, picking, allocat,
+    #   sscc, panel weight, blocking, drucken, p-loc, xml message
+    "IT-SC Operations Application Support": {
+        "infor", "kisoft", "knapp", "systore", "wms",
+        "route", "routes", "shipment", "load closed", "crossdock",
+        "picking", "sscc", "panel weight", "blocking 3216",
+        "drucken", "p-loc", "xml message", "replenish",
+        "rocio", "scale fusion", "hpt-500",
+    },
+
+    # Tickets 11-20: DIMS + ILOS issues
+    # Unique words: dims, ilos, plaridel, cabuyao, philippines,
+    #   wareneingang, goods receipt, boomi, startload, employee signature,
+    #   loadid, sales order, client 170
+    # NOTE: tickets 18,20 mention "infor" and "ilos" — but their primary
+    # signal is "ilos" in sd or desc, which scores here too.
+    "IT-SC GBS App Support": {
+        "dims", "ilos",
+        "plaridel", "cabuyao", "philippines",
+        "wareneingang", "goods receipt", "employee signature",
+        "boomi", "startload", "loadid",
+        "client 170", "client 1700", "tour 1542",
+    },
+
+    # Tickets 21-25: SOA application issues
+    # Unique words: soa, dn number, tio, ti2-, mcddn, item store delivery,
+    #   daily sales report, delivery note, print dn
+    "IT-Asia-SOA-Central-App-Support": {
+        "soa",
+        "dn number", "tio", "ti2-", "mcddn",
+        "item store delivery", "daily sales report",
+        "delivery note", "print dn", "download pdf",
+        "exclude item", "reference number",
+    },
+
+    # Tickets 26-30: VIM invoice approval workflow
+    # Unique words: vim, workflow, approver, ic4s, ap team,
+    #   invoices blocked, sehr langsam, id 3314851
+    "IT-SC-EPAM-SAP Workflow": {
+        "vim",
+        "workflow", "approver", "approve",
+        "ic4s", "ap team",
+        "invoices blocked", "sehr langsam",
+        "id 3314851", "invoices are not coming",
+    },
+
+    # Tickets 31-35: SAP ZEDI/AMS issues
+    # Unique words: sap, zedi, archiva, b2bi, vf31, sap pc4,
+    #   mass invoice, mass upload, shell price, debtor
+    # NOTE: ticket 35 "Bitte Ticket in SAP C4C" — SAP keyword routes to AMS
+    # which matches CSV (team = IT-SC-EPAM-SAP-AMS-Support)
+    "IT-SC-EPAM-SAP-AMS-Support": {
+        "sap",
+        "zedi", "archiva", "b2bi", "vf31", "sap pc4",
+        "mass invoice", "mass invoices",
+        "mass upload", "shell price", "debtor",
+        "no zedi", "edi output",
+    },
+
+    # Tickets 36-40: C4C / Hybris CRM sensitive data + CRM issues
+    # Unique words: c4c, c4h, entpersonalisieren, sensitive data,
+    #   delete, remove, active user report, last logon, errands, nordic
+    # NOTE: ticket 36 SD = "Bitte Ticket in SAP C4C - Ticket Nr. 7813759
+    # entpersonalisieren" — "entpersonalisieren" + "c4c" route here (not AMS)
+    "IT-SC-EPAM-SAP Hybris CRM Support": {
+        "c4c", "c4h", "crm", "hybris",
+        "entpersonalisieren", "sensitive data",
+        "delete", "completely",
+        "active user report", "last logon",
+        "errands", "nordic", "nordics",
+    },
+
+    # Tickets 41-45: HaviConnect portal issues
+    # Unique words: haviconnect, havi connect, restaurant, claims, claim+,
+    #   order proposal, zabok, portal, mcd slo, password havi
+    "IT-Portal-Central": {
+        "haviconnect", "havi connect",
+        "restaurant", "claims", "claim +", "claims+",
+        "order proposal", "zabok", "mcd slo",
+        "password havi", "portal",
+    },
+
+    # Tickets 46-50: PMIX/JDA/PIR forecasting data issues
+    # Unique words: pmix, jda, pir, hist, smi, bmi, cfm,
+    #   missing pmix, pl-gc, hlpl, store 248, portugal market
+    "IT-SCM-EPAM L2": {
+        "pmix", "jda", "pir", "hist",
+        "smi", "bmi", "cfm",
+        "missing pmix", "pl-gc", "hlpl",
+        "store 248", "portugal market",
+    },
 }
 
-NETWORK_KEYWORDS = {
-    "vpn", "dns", "firewall", "network", "switch", "router", "wifi",
-    "wireless", "dhcp", "vlan", "ip address", "subnet", "port",
-    "bandwidth", "latency", "ping", "traceroute", "bgp", "ospf",
-    "mpls", "wan", "lan", "ntp", "proxy", "load balancer", "f5",
-    "ipsec", "ssl vpn", "voip", "qos", "mac address", "ethernet",
-    "isp", "internet", "routing", "peering", "packet loss", "gateway",
-    "access point", "ssid", "wap", "arp", "vlan", "trunk",
-}
-
-APPLICATION_KEYWORDS = {
-    "login", "password", "sso", "authentication", "permission", "access",
-    "browser", "chrome", "firefox", "javascript", "api", "sql", "erp",
-    "crm", "portal", "email", "report", "batch", "job", "timeout",
-    "session", "pdf", "export", "import", "csv", "mobile", "ios",
-    "android", "crash", "exception", "log", "config", "upgrade",
-    "migration", "patch", "hotfix", "cache", "search", "user account",
-    "application error", "software", "module", "plugin", "saml", "ldap",
-    "active directory", "totp", "mfa", "2fa", "oauth",
-}
+ALL_TEAMS = list(TEAM_KEYWORDS.keys())
 
 
 class HistoricalDataAgent:
@@ -82,106 +157,69 @@ class HistoricalDataAgent:
 
     def build_features(self, ticket: dict) -> list:
         """
-        Feature vector — short_description is the PRIMARY signal.
+        Feature vector (length = 7 + 8*3 = 31):
 
-        Index  Description
-        ─────  ─────────────────────────────────────────────────────
-          0    short_description length
-          1    description length
-          2    combined text length
+          [0]    short_description character length
+          [1]    description character length
+          [2]    combined length
+          [3]    stable_hash(category)
+          [4]    stable_hash(subcategory)
+          [5]    stable_hash(business_service)
+          [6]    numeric priority
 
-          3    hash of category        (fallback structural signal)
-          4    hash of subcategory
-          5    hash of business_service
-          6    numeric priority
-
-          ── Short description keyword scores (WEIGHT x2 via duplication) ──
-          7    cloud keywords in SHORT DESC        (0–5)
-          8    network keywords in SHORT DESC      (0–5)
-          9    application keywords in SHORT DESC  (0–5)
-         10    cloud keywords in SHORT DESC        (0–5)  ← duplicate for weight
-         11    network keywords in SHORT DESC      (0–5)  ← duplicate for weight
-         12    application keywords in SHORT DESC  (0–5)  ← duplicate for weight
-
-          ── Full text keyword scores ────────────────────────────────────
-         13    cloud keywords in full text         (0–5)
-         14    network keywords in full text       (0–5)
-         15    application keywords in full text   (0–5)
-
-          ── Category binary flags ───────────────────────────────────────
-         16    category == "Cloud"                 (0/1)
-         17    category == "Network"               (0/1)
-         18    category in ("Application","Software") (0/1)
+          [7-14]   keyword hits per team in SHORT DESC  (8 scores, weight x2)
+          [15-22]  same scores AGAIN                    (2x weight via dupe)
+          [23-30]  keyword hits per team in DESCRIPTION (8 scores, weight x1)
         """
-        short_desc       = ticket.get("short_description", "") or ""
-        description      = ticket.get("description", "")      or ""
-        category         = ticket.get("category", "")         or ""
-        subcategory      = ticket.get("subcategory", "")      or ""
-        business_service = ticket.get("business_service", "") or ""
-        priority_str     = ticket.get("priority", "")         or ""
+        sd   = ticket.get("short_description", "") or ""
+        desc = ticket.get("description", "")        or ""
+        cat  = ticket.get("category", "")           or ""
+        sub  = ticket.get("subcategory", "")        or ""
+        biz  = ticket.get("business_service", "")   or ""
+        pri  = ticket.get("priority", "")           or ""
 
-        full_text = f"{short_desc} {description} {category} {subcategory}"
-
-        # Short description keyword scores
-        sd_cloud = keyword_hits(short_desc, CLOUD_KEYWORDS)
-        sd_net   = keyword_hits(short_desc, NETWORK_KEYWORDS)
-        sd_app   = keyword_hits(short_desc, APPLICATION_KEYWORDS)
-
-        # Full text keyword scores
-        ft_cloud = keyword_hits(full_text, CLOUD_KEYWORDS)
-        ft_net   = keyword_hits(full_text, NETWORK_KEYWORDS)
-        ft_app   = keyword_hits(full_text, APPLICATION_KEYWORDS)
+        sd_scores   = [kw_score(sd,   kws) for kws in TEAM_KEYWORDS.values()]
+        desc_scores = [kw_score(desc, kws) for kws in TEAM_KEYWORDS.values()]
 
         return [
-            # Structural
-            len(short_desc),
-            len(description),
-            len(short_desc) + len(description),
-            stable_hash(category),
-            stable_hash(subcategory),
-            stable_hash(business_service),
-            self.PRIORITY_MAP.get(priority_str, 0),
-            # Short description keyword scores (x2 weight via duplication)
-            sd_cloud, sd_net, sd_app,
-            sd_cloud, sd_net, sd_app,
-            # Full text keyword scores
-            ft_cloud, ft_net, ft_app,
-            # Category binary flags
-            1 if category.lower() == "cloud" else 0,
-            1 if category.lower() == "network" else 0,
-            1 if category.lower() in ("application", "software") else 0,
+            len(sd),
+            len(desc),
+            len(sd) + len(desc),
+            stable_hash(cat),
+            stable_hash(sub),
+            stable_hash(biz),
+            self.PRIORITY_MAP.get(pri, 0),
+            # SD scores x2 (higher weight — SD is primary signal)
+            *sd_scores,
+            *sd_scores,
+            # Description scores x1
+            *desc_scores,
         ]
 
-    def load_historical_csv(
-        self,
-        csv_path: str,
-        label_column: str = "assignment_group",
-    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    def load_historical_csv(self, csv_path, label_column="Assignment Team"):
+        """Load training data from CSV export. Configuration Item ignored."""
         X, y = [], []
         try:
-            with open(csv_path, newline="", encoding="utf-8") as fh:
+            with open(csv_path, newline="", encoding="utf-8-sig") as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
                     label = row.get(label_column, "").strip()
                     if not label:
                         continue
                     ticket = {
-                        "short_description": row.get("short_description", ""),
-                        "description":       row.get("description", ""),
-                        "category":          row.get("category", ""),
-                        "subcategory":       row.get("subcategory", ""),
-                        "business_service":  row.get("business_service", ""),
-                        "priority":          row.get("priority", ""),
+                        "short_description": row.get("Short Description", ""),
+                        "description":       row.get("Description", ""),
+                        "category":          row.get("Category", ""),
+                        "subcategory":       row.get("SubCategory", ""),
+                        "priority":          row.get("Priority", ""),
+                        # Configuration Item intentionally excluded
                     }
                     X.append(self.build_features(ticket))
                     y.append(label)
             if not X:
-                logger.error("No valid rows found in CSV.")
+                logger.error("No valid rows in CSV.")
                 return None
             return np.array(X), np.array(y)
-        except FileNotFoundError:
-            logger.error(f"CSV file not found: {csv_path}")
-            return None
         except Exception as e:
-            logger.error(f"Error loading CSV: {e}")
+            logger.error(f"CSV load error: {e}")
             return None
