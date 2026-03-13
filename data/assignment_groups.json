@@ -1,0 +1,12 @@
+{
+  "active_assignment_groups": [
+    "Network Support",
+    "Application Support",
+    "Cloud Operations"
+  ],
+  "deprecated_mapping": {
+    "Legacy Network Team": "Network Support",
+    "Old App Team": "Application Support",
+    "Infrastructure Team": "Cloud Operations"
+  }
+}
